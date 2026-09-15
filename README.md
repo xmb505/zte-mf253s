@@ -77,7 +77,7 @@ sudo modprobe zte_ecm zte_atfix
 
 ## 已知限制
 
-- **仅 IPv4**：固件虽支持 IPV6 PDP，但 ECM 通道没有 RA/NDP 转发能力，IPv6 实际不可用；
+- **仅 IPv4**：固件虽支持 IPV6 PDP，但 ECM 通道没有 RA/NDP 转发能力，IPv6 实际不可用。驱动会**在数据面直接丢弃所有 IPv6 帧**（计入 `tx_dropped`），并尽力关闭该网卡的 IPv6 协议栈——上层开不开 IPv6 都行，不会有任何 v6 包发到模块；
 - **仅 TD-LTE 硬件**：移动版模块没有 WCDMA 校准数据，插联通卡收不到信号（这不是锁）；
 - **不要热插拔 mSATA**：关机 → 插拔 → 开机；
 - 不同批次固件可能略有差异（开发基于 `ZTE_MF253SV1.0.0B01`）。

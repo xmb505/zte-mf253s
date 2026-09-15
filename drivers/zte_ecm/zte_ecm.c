@@ -21,17 +21,47 @@
  *    delivered through the modem's +ZGIPDNS URC and applied by the host (see
  *    zte_atfix),
  *  - traffic only starts flowing after the vendor command AT+ZGACT=1,1 has
- *    been issued on an AT interface.
+ *    been issued on an AT interface,
+ *  - IPv6 is not supported by the firmware, so this driver simply declares
+ *    the interface IPv6-incapable: every IPv6 frame handed to the netdev is
+ *    dropped on TX (upper layers may enable IPv6 freely, not a single IPv6
+ *    packet ever reaches the modem) and the per-device IPv6 stack is
+ *    best-effort disabled so well-behaved userlands skip it entirely.
  */
 
+#include <linux/ipv6.h>
 #include <linux/kernel.h>
 #include <linux/module.h>
 #include <linux/usb.h>
 #include <linux/usb/usbnet.h>
+#include <net/addrconf.h>
+#include <net/if_inet6.h>
 
 #define ZTE_VENDOR_ID	0x19d2
 #define ZTE_PRODUCT_ID	0x0199
 #define ZTE_ECM_IFACE	1
+
+static bool zte_ecm_v6_dropped;
+
+/*
+ * The firmware has no IPv6 data path (no RA/NDP handling, no DHCPv6, no
+ * global address), so IPv6 frames must never reach the modem.  Drop them
+ * here: usbnet then accounts them as tx_dropped.
+ */
+static struct sk_buff *zte_ecm_tx_fixup(struct usbnet *dev, struct sk_buff *skb,
+					gfp_t flags)
+{
+	if (skb->protocol == htons(ETH_P_IPV6)) {
+		if (!zte_ecm_v6_dropped) {
+			zte_ecm_v6_dropped = true;
+			netdev_info(dev->net,
+				    "dropping IPv6 traffic (firmware has no IPv6 data path)\n");
+		}
+		dev_kfree_skb_any(skb);
+		return NULL;
+	}
+	return skb;
+}
 
 /*
  * The interface has the data bulk endpoints plus a CDC interrupt status
@@ -43,6 +73,7 @@
 static const struct driver_info zte_ecm_info = {
 	.description	= "ZTE ZX297510 (MF253S) ECM data interface",
 	.flags		= FLAG_ETHER,
+	.tx_fixup	= zte_ecm_tx_fixup,
 	.status		= usbnet_cdc_status,
 	.manage_power	= usbnet_manage_power,
 };
@@ -74,7 +105,67 @@ static struct usb_driver zte_ecm_driver = {
 	.disable_hub_initiated_lpm = 1,
 };
 
-module_usb_driver(zte_ecm_driver);
+/*
+ * IPv6 is unusable on this modem (no RA/NDP, no DHCPv6, no global address),
+ * but both ModemManager and NetworkManager keep probing/announcing it, which
+ * only delays connections.  Switch it off per device as soon as the netdev
+ * appears, so every userland sees the interface as IPv6-disabled.
+ *
+ * The notifier is registered before the USB driver, and the addrconf
+ * notifier (registered at boot) runs first, so the inet6_dev exists by the
+ * time we get the registration event.
+ */
+static int zte_ecm_netdev_event(struct notifier_block *nb,
+				unsigned long event, void *ptr)
+{
+	struct net_device *dev = netdev_notifier_info_to_dev(ptr);
+	struct inet6_dev *idev;
+
+	if (event != NETDEV_REGISTER && event != NETDEV_UP)
+		return NOTIFY_DONE;
+
+	/* match only the netdevs created by this driver */
+	if (!dev->dev.parent ||
+	    dev->dev.parent->driver != &zte_ecm_driver.driver)
+		return NOTIFY_DONE;
+
+	idev = __in6_dev_get(dev);
+	if (idev && !idev->cnf.disable_ipv6) {
+		idev->cnf.disable_ipv6 = 1;
+		pr_info("zte_ecm: IPv6 disabled on %s (firmware has no IPv6 data path)\n",
+			dev->name);
+	}
+
+	return NOTIFY_OK;
+}
+
+static struct notifier_block zte_ecm_netdev_nb = {
+	.notifier_call = zte_ecm_netdev_event,
+};
+
+static int __init zte_ecm_init(void)
+{
+	int ret;
+
+	ret = register_netdevice_notifier(&zte_ecm_netdev_nb);
+	if (ret)
+		return ret;
+
+	ret = usb_register(&zte_ecm_driver);
+	if (ret)
+		unregister_netdevice_notifier(&zte_ecm_netdev_nb);
+
+	return ret;
+}
+
+static void __exit zte_ecm_exit(void)
+{
+	usb_deregister(&zte_ecm_driver);
+	unregister_netdevice_notifier(&zte_ecm_netdev_nb);
+}
+
+module_init(zte_ecm_init);
+module_exit(zte_ecm_exit);
 
 MODULE_DESCRIPTION("ZTE ZX297510 (MF253S) ECM data interface driver");
 MODULE_LICENSE("GPL");
