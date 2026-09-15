@@ -143,6 +143,13 @@ static bool zte_nwstate_ok = true;
 module_param_named(nwstate_ok, zte_nwstate_ok, bool, 0644);
 MODULE_PARM_DESC(nwstate_ok, "Answer %NWSTATE or report it unsupported (CME 4)");
 
+/* a fresh attach is required for the network to deliver MT SMS to this
+ * firmware; a plain CFUN=1 on an already attached modem does not renegotiate
+ * it (verified: MT SMS only arrives after a CFUN=0/CFUN=1 cycle) */
+static bool zte_force_reattach = true;
+module_param_named(force_reattach, zte_force_reattach, bool, 0644);
+MODULE_PARM_DESC(force_reattach, "Detach/reattach once during init so MT SMS works");
+
 /* values sniffed from the modem's own responses */
 static int zte_csq_raw = -1;
 static int zte_cereg_n;
@@ -865,6 +872,12 @@ static void zte_init_work_fn(struct work_struct *work)
 					apn = "ctnet";
 			pr_info("zte_atfix: IMSI %s -> APN %s\n", imsi, apn);
 		}
+	}
+
+	if (zte_force_reattach) {
+		pr_info("zte_atfix: detaching for a fresh attach (MT SMS)\n");
+		zte_send_cmd("AT+CFUN=0\r", resp, sizeof(resp), 5000);
+		msleep(2500);
 	}
 
 	snprintf(cmd, sizeof(cmd), "AT+CGDCONT=1,IP,%s,,0,0\r", apn);
