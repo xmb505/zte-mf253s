@@ -1,0 +1,104 @@
+# ZTE MF253S (ZX297510) Linux 驱动
+
+把运营商淘汰的 **ZTE MF253S / ME3760V2**（Sanechips ZX297510）mSATA 4G 模块变成 Linux 下的原生移动数据网卡。
+
+装上这两个内核模块（`zte_ecm` + `zte_atfix`）后，**任何装 stock ModemManager / NetworkManager 的发行版都能即插即用**：任务栏出现「移动数据」，点一下就联网。无需守护进程、无需 udev 规则、无需手工拨号。
+
+```
+NetworkManager ── ModemManager ──┬─ ttyUSB0 (AT, MM 管理)
+                                 │
+                           zte_atfix.ko ── ttyUSB1 (私有 AT 口：初始化/拨号/保活)
+                                 │
+                           zte_ecm.ko ───── if1 ECM ── enpXsYfZuVi1 (数据网卡)
+```
+
+## 支持的硬件
+
+| 项目 | 详情 |
+|---|---|
+| 模块 | ZTE MF253S / ME3760V2 |
+| 基带 | ZTE Sanechips ZX297510（WF7510） |
+| USB ID | `19d2:0199`（正常模式）、`19d2:0256`（BootROM） |
+| 制式 | TD-LTE（移动定制，硬件仅校准 GSM / TD-SCDMA / LTE） |
+| 接口 | if0 = USB-AT，if1 = USB-Rndis（ECM），if2 = USB-Modem，if3 = USB-log |
+
+## 这个模块为什么难搞
+
+- **QMI 是残废的**：任何 UIM/NAS 命令都会让它掉进 BootROM 重启；
+- **PPP 拨号被拒绝**：LTE 默认承载常开，`ATD*99` 回 `+CME ERROR: 3`；
+- **没有 DHCP**：IP/网关/DNS 只通过私有 URC `+ZGIPDNS` 下发；
+- **数据通道要私有命令激活**：`AT+CGACT=1,1` 之后还必须发 `AT+ZGACT=1,1`；
+- **21 秒自复位**：主机不轮询就自杀重启（CPE 逆向出的保活序列）；
+- **一堆标准命令不支持**：`ATZ`、`AT+GCAP`、`AT+WS46=?` 全部 `+CME ERROR: 6003`。
+
+## 工作原理
+
+`zte_atfix` 把模块伪装成 ModemManager 完整支持的 **ZTE Icera** 机型（MF821 一类），因为 MM 的 ZTE 插件对非 Icera 模块会忽略网卡口，而对 Icera 模块走「NET 口 + 静态 IP」的 bearer 路径——正好契合这台 ECM-only 的机器。
+
+| ModemManager 发出的命令 | 驱动处理 |
+|---|---|
+| `ATZ` | 重写为 `ATE0` |
+| `AT+GCAP` | 伪造 `+GCAP: +CGSM,+CLTE`（启用 EPS/LTE 跟踪） |
+| `AT+WS46=?` | 伪造模式列表 |
+| `AT%IPSYS?` | 伪造 `%IPSYS: 0,1,0` → MM 判定为 Icera 模块 |
+| `AT%IPDPACT=<cid>,1` | **翻译为真实拨号**：`AT+CGACT=1,1` + `AT+ZGACT=1,1`，完成后回 OK + `%IPDPACT` URC |
+| `AT%IPDPADDR=<cid>` | 用嗅探到的 `+ZGIPDNS` 缓存应答静态 IPv4 配置 |
+
+其他要点：
+
+- **内核心跳**：probe 后自动执行 CPE 逆向出的初始化序列，并每 2 秒轮询 `AT+CSQ`/`AT+CEREG?`/`AT+COPS?`，彻底杜绝 21 秒自复位；
+- **私有口隐身**：驱动用 if2 做自己的事情（初始化/拨号/保活），并把 MM 探口的裸 `AT` 探测吞掉，MM 会把该口标记为「非 AT 口」自动无视；
+- **驱动内关闭 USB autosuspend**，不需要任何 udev 规则；
+- **APN 自动识别**：按 IMSI 前五位选择 CMNET / 3gnet / ctnet。
+
+## 安装
+
+```bash
+# 依赖：内核头文件
+sudo apt install build-essential linux-headers-$(uname -r)
+
+# 编译
+make -C drivers/zte_ecm
+make -C drivers/zte_atfix
+
+# 安装
+sudo cp drivers/zte_ecm/zte_ecm.ko drivers/zte_atfix/zte_atfix.ko /lib/modules/$(uname -r)/extra/
+sudo depmod -a
+
+# 开机自动加载 + 黑名单 qmi_wwan（重要：MM 用 QMI 探它会把它搞崩）
+printf 'zte_ecm\nzte_atfix\n' | sudo tee /etc/modules-load.d/zte.conf
+echo 'blacklist qmi_wwan' | sudo tee /etc/modprobe.d/zz-zte.conf
+
+# 立即加载
+sudo modprobe zte_ecm zte_atfix
+```
+
+然后重启 ModemManager（或直接重启电脑），`nmcli device status` 里就会出现 `gsm` 设备，点击连接即可。
+
+## 已知限制
+
+- **仅 IPv4**：固件虽支持 IPV6 PDP，但 ECM 通道没有 RA/NDP 转发能力，IPv6 实际不可用；
+- **仅 TD-LTE 硬件**：移动版模块没有 WCDMA 校准数据，插联通卡收不到信号（这不是锁）；
+- **不要热插拔 mSATA**：关机 → 插拔 → 开机；
+- 不同批次固件可能略有差异（开发基于 `ZTE_MF253SV1.0.0B01`）。
+
+## 目录结构
+
+```
+drivers/zte_ecm/     ECM 数据口驱动（usbnet）
+drivers/zte_atfix/   AT 修复 + Icera 伪装 + 拨号翻译 + 链路管理
+tools/               （历史遗留）用户态守护进程版本，仅供参考
+docs/                设计与逆向笔记
+research/            固件分析、CPE 逆向资料（不含固件二进制）
+extras/              同硬件上的蜂鸣器整活项目
+```
+
+## 许可证
+
+本仓库中 **用户态工具与文档** 采用 MIT 许可证（见 `LICENSE`）。
+
+`drivers/` 下的内核模块为 **GPL-2.0**（内核模块必须与内核兼容，源码头部已标注 SPDX）。
+
+---
+
+*本项目与 ZTE 无关，仅供学习研究。刷机、拆机有风险，请自行承担后果。*

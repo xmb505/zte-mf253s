@@ -1,0 +1,44 @@
+# kernel module build artifacts
+*.ko
+*.o
+*.mod
+*.mod.c
+*.cmd
+.*.cmd
+.tmp_versions/
+modules.order
+Module.symvers
+
+# vendor firmware / blobs (not redistributable, large)
+firmware/
+research/ap/
+research/firmware/
+research/salesdl/
+research/container/partitions/
+research/modem/0x11F5B4/
+research/modem/0x181040/
+research/modem/analyze/
+research/modem/initramfs/
+research/modem/*.bin
+research/modem/*.cpio
+research/modem/*_fs/
+research/modem/*_rootfs/
+research/modem/pscpu_strings.txt
+**/*.lzma
+**/*.squashfs
+**/*.cramfs
+**/*.jffs2
+**/root_uImage
+**/*.img
+**/*.elf
+**/*.exe
+**/*.sdi
+**/*.cfg
+*.zip
+
+# logs, caches, editor/tool state
+*.log
+__pycache__/
+*.pyc
+.qoder/
+.vscode/
