@@ -878,6 +878,21 @@ static void zte_init_work_fn(struct work_struct *work)
 		pr_info("zte_atfix: detaching for a fresh attach (MT SMS)\n");
 		zte_send_cmd("AT+CFUN=0\r", resp, sizeof(resp), 5000);
 		msleep(2500);
+		zte_send_cmd("AT+CFUN=1\r", resp, sizeof(resp), 8000);
+	}
+	/* wait until the re-attach completed before touching the context */
+	for (i = 0; i < 20; i++) {
+		char *p;
+
+		msleep(1500);
+		zte_send_cmd("AT+CEREG?\r", resp, sizeof(resp), 1500);
+		p = strstr(resp, "+CEREG:");
+		if (p && strchr(p, ',')) {
+			int n = 0, st = 0;
+
+			if (sscanf(p, "+CEREG: %d,%d", &n, &st) == 2 && st == 1)
+				break;
+		}
 	}
 
 	snprintf(cmd, sizeof(cmd), "AT+CGDCONT=1,IP,%s,,0,0\r", apn);
@@ -885,13 +900,24 @@ static void zte_init_work_fn(struct work_struct *work)
 		zte_send_cmd("AT+ZEACT=2\r", NULL, 0, 1000);
 		zte_send_cmd(cmd, NULL, 0, 1500);
 		zte_send_cmd("AT+ZGAAT=0\r", NULL, 0, 1000);
-		zte_send_cmd("AT+CFUN=1\r", resp, sizeof(resp), 3000);
+		if (!zte_force_reattach)
+			zte_send_cmd("AT+CFUN=1\r", resp, sizeof(resp), 3000);
 		zte_send_cmd("AT+ZSET=EXCEPT_RESET,1\r", NULL, 0, 1000);
 		zte_send_cmd("AT+ZEMCI=0\r", NULL, 0, 1500);
 		if (zte_cmd_response_ok(resp))
 			break;
 		msleep(2000);
 	}
+
+	/* a CFUN cycle leaves the ECM data path unbound: activate the
+	 * context and bind it right away, otherwise traffic only starts
+	 * after MM re-dials (or not at all) */
+	zte_send_cmd("AT+CGACT=1,1\r", resp, sizeof(resp), 5000);
+	pr_info("zte_atfix: CGACT => %s\n", resp);
+	if (zte_send_cmd("AT+ZGACT=1,1\r", resp, sizeof(resp), 5000) == 0)
+		pr_info("zte_atfix: ZGACT => %s\n", resp);
+	else
+		pr_warn("zte_atfix: ZGACT timed out\n");
 
 	pr_info("zte_atfix: link init done (APN %s)\n", apn);
 	queue_delayed_work(zte_wq, &zte_poll_work, msecs_to_jiffies(500));
