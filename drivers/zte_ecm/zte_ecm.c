@@ -143,6 +143,86 @@ static struct notifier_block zte_ecm_netdev_nb = {
 	.notifier_call = zte_ecm_netdev_event,
 };
 
+/*
+ * qmi_wwan also matches this interface and would crash the firmware with
+ * QMI probing; option may grab the other interfaces.  Take our interface
+ * over deterministically: release any competing driver and force-attach
+ * ours (USB devices do not support the driver core's driver_override, so
+ * device_driver_attach is used to bypass the probe-order race).
+ */
+static struct work_struct zte_ecm_claim_work;
+static bool zte_ecm_claim_attach;
+
+/* not declared in the installed headers */
+extern int device_driver_attach(const struct device_driver *drv,
+				struct device *dev);
+
+static int zte_ecm_claim_walk(struct usb_device *udev, void *data)
+{
+	struct usb_interface *intf;
+	struct device *dev;
+	int i;
+
+	if (!udev->actconfig)
+		return 0;
+	if (le16_to_cpu(udev->descriptor.idVendor) != ZTE_VENDOR_ID ||
+	    le16_to_cpu(udev->descriptor.idProduct) != ZTE_PRODUCT_ID)
+		return 0;
+
+	for (i = 0; i < udev->actconfig->desc.bNumInterfaces; i++) {
+		intf = udev->actconfig->interface[i];
+		if (!intf || !intf->cur_altsetting)
+			continue;
+		if (intf->cur_altsetting->desc.bInterfaceNumber != ZTE_ECM_IFACE)
+			continue;
+
+		dev = &intf->dev;
+		if (dev->driver && strcmp(dev->driver->name, "zte_ecm")) {
+			dev_info(dev, "zte_ecm: releasing competing driver '%s'\n",
+				 dev->driver->name);
+			device_release_driver(dev);
+		}
+		if (zte_ecm_claim_attach && !dev->driver)
+			device_driver_attach(&zte_ecm_driver.driver, dev);
+	}
+	return 0;
+}
+
+static void zte_ecm_claim_work_fn(struct work_struct *work)
+{
+	zte_ecm_claim_attach = true;
+	usb_for_each_dev(NULL, zte_ecm_claim_walk);
+	zte_ecm_claim_attach = false;
+}
+
+static struct delayed_work zte_ecm_claim_watch_work;
+
+static void zte_ecm_claim_watch_fn(struct work_struct *work)
+{
+	zte_ecm_claim_work_fn(work);
+	queue_delayed_work(system_wq, &zte_ecm_claim_watch_work,
+			   msecs_to_jiffies(1000));
+}
+
+static int zte_ecm_usb_notify(struct notifier_block *nb, unsigned long action,
+			      void *data)
+{
+	struct usb_device *udev = data;
+
+	if (action != USB_DEVICE_ADD)
+		return NOTIFY_OK;
+	if (le16_to_cpu(udev->descriptor.idVendor) != ZTE_VENDOR_ID ||
+	    le16_to_cpu(udev->descriptor.idProduct) != ZTE_PRODUCT_ID)
+		return NOTIFY_OK;
+
+	schedule_work(&zte_ecm_claim_work);
+	return NOTIFY_OK;
+}
+
+static struct notifier_block zte_ecm_usb_nb = {
+	.notifier_call = zte_ecm_usb_notify,
+};
+
 static int __init zte_ecm_init(void)
 {
 	int ret;
@@ -151,15 +231,31 @@ static int __init zte_ecm_init(void)
 	if (ret)
 		return ret;
 
-	ret = usb_register(&zte_ecm_driver);
-	if (ret)
-		unregister_netdevice_notifier(&zte_ecm_netdev_nb);
+	INIT_WORK(&zte_ecm_claim_work, zte_ecm_claim_work_fn);
+	INIT_DELAYED_WORK(&zte_ecm_claim_watch_work, zte_ecm_claim_watch_fn);
 
-	return ret;
+	/* release whoever grabbed the interface before us */
+	usb_for_each_dev(NULL, zte_ecm_claim_walk);
+	usb_register_notify(&zte_ecm_usb_nb);
+
+	ret = usb_register(&zte_ecm_driver);
+	if (ret) {
+		usb_unregister_notify(&zte_ecm_usb_nb);
+		cancel_work_sync(&zte_ecm_claim_work);
+		unregister_netdevice_notifier(&zte_ecm_netdev_nb);
+		return ret;
+	}
+
+	queue_delayed_work(system_wq, &zte_ecm_claim_watch_work,
+			   msecs_to_jiffies(1000));
+	return 0;
 }
 
 static void __exit zte_ecm_exit(void)
 {
+	usb_unregister_notify(&zte_ecm_usb_nb);
+	cancel_work_sync(&zte_ecm_claim_work);
+	cancel_delayed_work_sync(&zte_ecm_claim_watch_work);
 	usb_deregister(&zte_ecm_driver);
 	unregister_netdevice_notifier(&zte_ecm_netdev_nb);
 }

@@ -98,10 +98,56 @@ static const char * const zte_patterns[] = {
 	"AT+GCAP",
 	"AT+WS46=?",
 	"AT%IPSYS?",
+	"AT%NWSTATE",
+	"AT+CSQ",
+	"AT+CEREG?",
 };
 
 #define ZTE_VAR_IPDPADDR	"AT%IPDPADDR="
 #define ZTE_VAR_IPDPACT		"AT%IPDPACT="
+#define ZTE_VAR_CEREG		"AT+CEREG="
+
+/*
+ * This firmware reports a non-standard CSQ value: for valid readings the
+ * "rssi" byte is 253 + RSRP(dBm) (e.g. 149 -> RSRP -104 dBm), while 0/99/100
+ * mark an unknown value.  ModemManager expects the standard 0..31 RSSI
+ * scale (RSSI -113..-51 dBm, 2 dBm per unit), so convert RSRP into an
+ * approximate RSSI first (adding the typical LTE bandwidth offset) and then
+ * apply the standard mapping.
+ */
+#define ZTE_CSQ_RSRP_BASE	253
+#define ZTE_CSQ_RSRP_TO_RSSI	25
+#define ZTE_ACT_LTE		7
+
+/* Technology string reported in the faked %NWSTATE response.  MM's Icera
+ * parser only knows 2G/3G strings (there is no LTE case), so this is a
+ * module parameter to allow picking the closest one at runtime. */
+static char *zte_nwstate_tech = "HSDPA-HSUPA-HSPA+";
+module_param_named(nwstate_tech, zte_nwstate_tech, charp, 0644);
+MODULE_PARM_DESC(nwstate_tech, "Technology string for the faked %NWSTATE");
+
+static bool zte_nwstate_ok = true;
+module_param_named(nwstate_ok, zte_nwstate_ok, bool, 0644);
+MODULE_PARM_DESC(nwstate_ok, "Answer %NWSTATE or report it unsupported (CME 4)");
+
+/* values sniffed from the modem's own responses */
+static int zte_csq_raw = -1;
+static int zte_cereg_n;
+static int zte_cereg_stat = -1;
+
+static int zte_csq_normalize(int raw)
+{
+	int rssi;
+
+	if (raw <= 0 || raw == 99 || raw == 100 || raw > 191)
+		return -1;
+	rssi = raw - ZTE_CSQ_RSRP_BASE + ZTE_CSQ_RSRP_TO_RSSI;
+	if (rssi <= -113)
+		return 0;
+	if (rssi >= -51)
+		return 31;
+	return (rssi + 113) / 2;
+}
 
 /* per-port command-fixup state */
 struct zte_atfix_port {
@@ -130,6 +176,7 @@ static struct zte_ip_cache zte_cache;
 
 /* private command channel (interface 2) */
 static struct usb_serial_port *zte_cmd_port;
+static struct usb_serial_port *zte_at_port;
 static DEFINE_SPINLOCK(zte_cmd_lock);
 static struct completion zte_cmd_done;
 static bool zte_cmd_pending;
@@ -164,7 +211,11 @@ static const char * const zte_poll_cmds[] = {
 };
 
 static void zte_atfix_inject(struct usb_serial_port *port, const char *str);
+static void zte_atfix_forward(struct tty_struct *tty,
+			      struct usb_serial_port *port,
+			      const u8 *data, int len);
 static void zte_cache_zgipdns(const u8 *data, unsigned int len);
+static void zte_sniff_rx(const u8 *data, unsigned int len);
 
 static int zte_ifnum(struct usb_serial_port *port)
 {
@@ -244,7 +295,7 @@ static void zte_priv_read_cb(struct urb *urb)
 	if (urb->actual_length) {
 		bool complete = false;
 
-		zte_cache_zgipdns(urb->transfer_buffer, urb->actual_length);
+		zte_sniff_rx(urb->transfer_buffer, urb->actual_length);
 
 		spin_lock_irqsave(&zte_cmd_lock, flags);
 		if (zte_cmd_pending && zte_cmd_port == port) {
@@ -343,6 +394,140 @@ static void zte_cache_zgipdns(const u8 *data, unsigned int len)
 	strscpy(zte_cache.dns2, dns2, sizeof(zte_cache.dns2));
 	zte_cache.valid = true;
 	spin_unlock_irqrestore(&zte_cache.lock, flags);
+}
+
+/* sniff "+CSQ: <raw>,<ber>" responses (any port) */
+static void zte_sniff_csq(const u8 *data, unsigned int len)
+{
+	const char *p = zte_memmem(data, len, "+CSQ:");
+
+	if (p) {
+		int raw = -1;
+
+		if (sscanf(p, "+CSQ: %d", &raw) == 1 && raw >= 0)
+			WRITE_ONCE(zte_csq_raw, raw);
+	}
+}
+
+/* sniff "+CEREG: <n>,<stat>..." responses (any port) */
+static void zte_sniff_cereg(const u8 *data, unsigned int len)
+{
+	const char *p = zte_memmem(data, len, "+CEREG:");
+
+	if (p) {
+		int n = 0, stat = -1;
+
+		if (sscanf(p, "+CEREG: %d,%d", &n, &stat) == 2 && stat >= 0) {
+			WRITE_ONCE(zte_cereg_n, n);
+			WRITE_ONCE(zte_cereg_stat, stat);
+		}
+	}
+}
+
+static void zte_sniff_rx(const u8 *data, unsigned int len)
+{
+	zte_cache_zgipdns(data, len);
+	zte_sniff_csq(data, len);
+	zte_sniff_cereg(data, len);
+}
+
+/* MM expects the standard 0..31 CSQ range; also give it the LTE AcT that
+ * this firmware omits from +CEREG. */
+/* 0..5 signal level used both by the CSQ spoof and the %NWSTATE spoof, so
+ * MM sees one consistent value no matter which source it reads */
+static int zte_signal_level(void)
+{
+	int csq = zte_csq_normalize(READ_ONCE(zte_csq_raw));
+
+	if (csq < 0)
+		return -1;
+	return (csq * 5 + 15) / 31;
+}
+
+static void zte_answer_csq(struct usb_serial_port *port)
+{
+	int lvl = zte_signal_level();
+	int csq = (lvl >= 0) ? lvl * 31 / 5 : -1;
+	char resp[48];
+
+	if (csq < 0)
+		snprintf(resp, sizeof(resp), "\r\n+CSQ: 99,99\r\n\r\nOK\r\n");
+	else
+		snprintf(resp, sizeof(resp),
+			 "\r\n+CSQ: %d,99\r\n\r\nOK\r\n", csq);
+	dev_info(&port->dev, "answering AT+CSQ (raw %d -> level %d -> %d)\n",
+		 READ_ONCE(zte_csq_raw), lvl, csq);
+	zte_atfix_inject(port, resp);
+}
+
+static void zte_answer_cereg(struct usb_serial_port *port)
+{
+	char resp[64];
+
+	snprintf(resp, sizeof(resp),
+		 "\r\n+CEREG: %d,%d,,,%d\r\n\r\nOK\r\n",
+		 READ_ONCE(zte_cereg_n), READ_ONCE(zte_cereg_stat),
+		 ZTE_ACT_LTE);
+	dev_info(&port->dev, "answering AT+CEREG? (LTE act)\n");
+	zte_atfix_inject(port, resp);
+}
+
+/*
+ * Answer MM's Icera access-technology query.  The mapping in MM only knows
+ * 2G/3G strings, so the reported technology is configurable (see the
+ * nwstate_tech module parameter).
+ */
+static void zte_answer_nwstate(struct usb_serial_port *port)
+{
+	int lvl = zte_signal_level();
+	int rssi = (lvl >= 0) ? lvl : 3;
+	char resp[128];
+
+	if (!zte_nwstate_ok) {
+		/* declaring it unsupported makes MM stop polling access
+		 * technologies, so the LTE AcT from +CEREG can stick */
+		dev_info(&port->dev, "reporting AT%%NWSTATE as unsupported\n");
+		zte_atfix_inject(port, "\r\n+CME ERROR: 4\r\n");
+		return;
+	}
+
+	snprintf(resp, sizeof(resp),
+		 "\r\n%%NWSTATE: %d,0,%s,%s,2\r\n\r\nOK\r\n",
+		 rssi, zte_nwstate_tech, zte_nwstate_tech);
+	dev_info(&port->dev, "answering AT%%NWSTATE (tech %s)\n",
+		 zte_nwstate_tech);
+	zte_atfix_inject(port, resp);
+}
+
+static void zte_augment_cereg_urc(struct usb_serial_port *port,
+				  const struct zte_atfix_port *st,
+				  const u8 *data, unsigned int len)
+{
+	char resp[64];
+
+	if (st->ifnum != ZTE_IF_AT)
+		return;
+	if (READ_ONCE(zte_cereg_stat) < 0)
+		return;
+	if (!zte_memmem(data, len, "+CEREG:"))
+		return;
+
+	snprintf(resp, sizeof(resp), "\r\n+CEREG: %d,%d,,,%d\r\n",
+		 READ_ONCE(zte_cereg_n), READ_ONCE(zte_cereg_stat),
+		 ZTE_ACT_LTE);
+	zte_atfix_inject(port, resp);
+}
+
+/* remember the URC mode MM configures, then pass AT+CEREG=<n> through */
+static void zte_cache_cereg_cmd(struct tty_struct *tty,
+				struct usb_serial_port *port,
+				struct zte_atfix_port *st)
+{
+	int n;
+
+	if (sscanf(st->pending + strlen(ZTE_VAR_CEREG), "%d", &n) == 1)
+		WRITE_ONCE(zte_cereg_n, n);
+	zte_atfix_forward(tty, port, st->pending, st->pending_len);
 }
 
 static bool zte_cache_get(char *ip, size_t ipsz, char *gw, size_t gwsz,
@@ -534,15 +719,20 @@ static bool zte_var_hold(const u8 *p, int len)
 {
 	size_t alen = strlen(ZTE_VAR_IPDPADDR);
 	size_t clen = strlen(ZTE_VAR_IPDPACT);
+	size_t rlen = strlen(ZTE_VAR_CEREG);
 
 	if ((size_t)len < alen && !memcmp(p, ZTE_VAR_IPDPADDR, len))
 		return true;
 	if ((size_t)len < clen && !memcmp(p, ZTE_VAR_IPDPACT, len))
 		return true;
+	if ((size_t)len < rlen && !memcmp(p, ZTE_VAR_CEREG, len))
+		return true;
 
 	if ((size_t)len >= alen && !memcmp(p, ZTE_VAR_IPDPADDR, alen))
 		return memchr(p, '\r', len) == NULL;
 	if ((size_t)len >= clen && !memcmp(p, ZTE_VAR_IPDPACT, clen))
+		return memchr(p, '\r', len) == NULL;
+	if ((size_t)len >= rlen && !memcmp(p, ZTE_VAR_CEREG, rlen))
 		return memchr(p, '\r', len) == NULL;
 
 	return false;
@@ -553,7 +743,8 @@ static bool zte_var_complete(const u8 *p, int len)
 	if (len <= 0 || p[len - 1] != '\r')
 		return false;
 	return !memcmp(p, ZTE_VAR_IPDPADDR, strlen(ZTE_VAR_IPDPADDR)) ||
-	       !memcmp(p, ZTE_VAR_IPDPACT, strlen(ZTE_VAR_IPDPACT));
+	       !memcmp(p, ZTE_VAR_IPDPACT, strlen(ZTE_VAR_IPDPACT)) ||
+	       !memcmp(p, ZTE_VAR_CEREG, strlen(ZTE_VAR_CEREG));
 }
 
 /* ---------------------------------------------------------------------- */
@@ -563,10 +754,12 @@ static void zte_poll_work_fn(struct work_struct *work)
 {
 	char resp[256];
 	unsigned long flags;
+	struct usb_serial_port *at_port;
 	bool alive;
 
 	spin_lock_irqsave(&zte_cmd_lock, flags);
 	alive = zte_cmd_port != NULL;
+	at_port = zte_at_port;
 	spin_unlock_irqrestore(&zte_cmd_lock, flags);
 	if (!alive)
 		return;
@@ -574,6 +767,20 @@ static void zte_poll_work_fn(struct work_struct *work)
 	zte_send_cmd(zte_poll_cmds[zte_poll_idx %
 				   ARRAY_SIZE(zte_poll_cmds)],
 		     resp, sizeof(resp), 1500);
+
+	/* Feed MM an act-bearing CEREG URC at a slow pace: the firmware never
+	 * emits one itself, MM relies on URCs (not polling) for registration
+	 * and the registration-check result is not used for the technology. */
+	if (at_port && (zte_poll_idx % 7) == 0 &&
+	    READ_ONCE(zte_cereg_stat) >= 0) {
+		char urc[64];
+
+		snprintf(urc, sizeof(urc), "\r\n+CEREG: %d,%d,,,%d\r\n",
+			 READ_ONCE(zte_cereg_n), READ_ONCE(zte_cereg_stat),
+			 ZTE_ACT_LTE);
+		zte_atfix_inject(at_port, urc);
+	}
+
 	zte_poll_idx++;
 	queue_delayed_work(zte_wq, &zte_poll_work, msecs_to_jiffies(2000));
 }
@@ -665,6 +872,14 @@ static int zte_atfix_port_probe(struct usb_serial_port *port)
 
 	usb_set_serial_port_data(port, st);
 
+	if (ifnum == ZTE_IF_AT) {
+		unsigned long flags;
+
+		spin_lock_irqsave(&zte_cmd_lock, flags);
+		zte_at_port = port;
+		spin_unlock_irqrestore(&zte_cmd_lock, flags);
+	}
+
 	if (ifnum == ZTE_IF_MODEM) {
 		unsigned long flags;
 
@@ -701,6 +916,8 @@ static void zte_atfix_port_remove(struct usb_serial_port *port)
 		zte_cmd_port = NULL;
 		zte_cmd_pending = false;
 	}
+	if (zte_at_port == port)
+		zte_at_port = NULL;
 	spin_unlock_irqrestore(&zte_cmd_lock, flags);
 
 	if (zte_priv_urb) {
@@ -874,6 +1091,31 @@ static int zte_atfix_write(struct tty_struct *tty, struct usb_serial_port *port,
 					st->logged_ipsys = true;
 				}
 				zte_atfix_inject(port, ipsys_resp);
+			} else if (!memcmp(st->pending, "AT%NWSTATE\r", 11)) {
+				if (st->ifnum == ZTE_IF_AT)
+					zte_answer_nwstate(port);
+				else
+					zte_atfix_forward(tty, port, st->pending,
+							  st->pending_len);
+			} else if (!memcmp(st->pending, "AT+CSQ\r", 7)) {
+				/* modem answers an out-of-range value that MM
+				 * would clamp to 100%; normalize it, but only
+				 * on the interface MM owns */
+				if (st->ifnum == ZTE_IF_AT &&
+				    zte_csq_normalize(READ_ONCE(zte_csq_raw)) >= 0)
+					zte_answer_csq(port);
+				else
+					zte_atfix_forward(tty, port, st->pending,
+							  st->pending_len);
+			} else if (!memcmp(st->pending, "AT+CEREG?\r", 10)) {
+				/* the firmware omits the AcT field, so MM can
+				 * never learn the access technology */
+				if (st->ifnum == ZTE_IF_AT &&
+				    READ_ONCE(zte_cereg_stat) >= 0)
+					zte_answer_cereg(port);
+				else
+					zte_atfix_forward(tty, port, st->pending,
+							  st->pending_len);
 			} else {
 				if (!st->logged_ws46) {
 					dev_info(&port->dev,
@@ -891,8 +1133,11 @@ static int zte_atfix_write(struct tty_struct *tty, struct usb_serial_port *port,
 			if (!memcmp(st->pending, ZTE_VAR_IPDPADDR,
 				    strlen(ZTE_VAR_IPDPADDR)))
 				zte_answer_ipdpaddr(port, st->pending);
-			else
+			else if (!memcmp(st->pending, ZTE_VAR_IPDPACT,
+					 strlen(ZTE_VAR_IPDPACT)))
 				zte_answer_ipdpact(port, st->pending);
+			else
+				zte_cache_cereg_cmd(tty, port, st);
 			st->pending_len = 0;
 			continue;
 		}
@@ -927,8 +1172,11 @@ static void zte_atfix_process_read_urb(struct urb *urb)
 		if (st && urb->actual_length) {
 			bool done = false;
 
-			zte_cache_zgipdns(urb->transfer_buffer,
-					  urb->actual_length);
+			zte_sniff_rx(urb->transfer_buffer,
+				     urb->actual_length);
+			zte_augment_cereg_urc(port, st,
+					      urb->transfer_buffer,
+					      urb->actual_length);
 
 			/* capture responses to our own commands */
 			spin_lock_irqsave(&zte_cmd_lock, flags);
@@ -993,18 +1241,136 @@ static struct usb_serial_driver zte_atfix_device = {
 	.unthrottle      = usb_serial_generic_unthrottle,
 };
 
+/* ---------------------------------------------------------------------- */
+/* device claiming                                                        */
+/*
+ * The modem's interfaces are also claimed by the generic drivers (option
+ * matches all vendor interfaces, qmi_wwan matches the data interface and
+ * would crash this firmware with QMI probing), and whichever driver probes
+ * first wins.  That races badly on cold boot and on hot plug, so the device
+ * must be taken over deterministically:
+ *
+ *  - on module load, release any competing driver that already grabbed an
+ *    interface; our driver registration then binds it right away,
+ *  - on hot plug, a USB notifier releases the competitor and force-attaches
+ *    our driver (device_driver_attach probes that specific driver, so the
+ *    generic drivers never get a chance to keep it).
+ *
+ * USB devices do not support the driver core's driver_override mechanism,
+ * hence the explicit detach/attach dance.
+ *
+ * interface 0/2/3 -> zte_atfix, interface 1 (ECM) -> zte_ecm (owned by that
+ * module, which runs the same logic for its interface).
+ */
+
+#define ZTE_ATFIX_NAME	"zte_atfix"
+
+/* not declared in the installed headers */
+extern int device_driver_attach(const struct device_driver *drv,
+				struct device *dev);
+
+static struct work_struct zte_claim_work;
+static struct delayed_work zte_claim_watch_work;
+static bool zte_claim_attach;
+
+static void zte_claim_interface(struct usb_interface *intf)
+{
+	struct device *dev = &intf->dev;
+	int ifnum;
+
+	if (!intf->cur_altsetting)
+		return;
+	ifnum = intf->cur_altsetting->desc.bInterfaceNumber;
+	if (ifnum != ZTE_IF_AT && ifnum != ZTE_IF_MODEM &&
+	    ifnum != ZTE_IF_LOG)
+		return;
+
+	if (dev->driver && strcmp(dev->driver->name, ZTE_ATFIX_NAME)) {
+		dev_info(dev, "zte_atfix: releasing competing driver '%s'\n",
+			 dev->driver->name);
+		device_release_driver(dev);
+	}
+
+	/* force-bind our driver when it is already registered */
+	if (zte_claim_attach && !dev->driver &&
+	    zte_atfix_device.usb_driver)
+		device_driver_attach(&zte_atfix_device.usb_driver->driver, dev);
+}
+
+static int zte_claim_walk(struct usb_device *udev, void *data)
+{
+	int i;
+
+	if (!udev->actconfig)
+		return 0;
+	if (le16_to_cpu(udev->descriptor.idVendor) != ZTE_VID ||
+	    le16_to_cpu(udev->descriptor.idProduct) != ZTE_PID)
+		return 0;
+
+	for (i = 0; i < udev->actconfig->desc.bNumInterfaces; i++) {
+		if (udev->actconfig->interface[i])
+			zte_claim_interface(udev->actconfig->interface[i]);
+	}
+	return 0;
+}
+
+static void zte_claim_work_fn(struct work_struct *work)
+{
+	zte_claim_attach = true;
+	usb_for_each_dev(NULL, zte_claim_walk);
+	zte_claim_attach = false;
+}
+
+/*
+ * Safety net: interface reconfiguration (e.g. toggling "authorized") does
+ * not generate USB_DEVICE_ADD events, so the generic drivers can grab the
+ * interfaces again without any notification.  Re-check at a slow pace and
+ * take them back whenever that happened.
+ */
+static void zte_claim_watch_fn(struct work_struct *work)
+{
+	zte_claim_work_fn(work);
+	queue_delayed_work(system_wq, &zte_claim_watch_work,
+			   msecs_to_jiffies(1000));
+}
+
+static int zte_usb_notify(struct notifier_block *nb, unsigned long action,
+			  void *data)
+{
+	struct usb_device *udev = data;
+
+	if (action != USB_DEVICE_ADD)
+		return NOTIFY_OK;
+	if (le16_to_cpu(udev->descriptor.idVendor) != ZTE_VID ||
+	    le16_to_cpu(udev->descriptor.idProduct) != ZTE_PID)
+		return NOTIFY_OK;
+
+	/* generic drivers may have bound the interfaces during enumeration:
+	 * take them back */
+	schedule_work(&zte_claim_work);
+	return NOTIFY_OK;
+}
+
+static struct notifier_block zte_usb_nb = {
+	.notifier_call = zte_usb_notify,
+};
+
 static struct usb_serial_driver *const zte_atfix_drivers[] = {
 	&zte_atfix_device, NULL
 };
 
 static int __init zte_atfix_init(void)
 {
+	int ret;
+
 	spin_lock_init(&zte_cache.lock);
 	spin_lock_init(&zte_cmd_lock);
 	spin_lock_init(&zte_dial_lock);
 	init_completion(&zte_cmd_done);
 	INIT_WORK(&zte_init_work, zte_init_work_fn);
 	INIT_WORK(&zte_dial_work, zte_dial_work_fn);
+	INIT_WORK(&zte_claim_work, zte_claim_work_fn);
+	INIT_DELAYED_WORK(&zte_claim_watch_work, zte_claim_watch_fn);
 	INIT_DELAYED_WORK(&zte_poll_work, zte_poll_work_fn);
 
 	zte_cmd_buf = kmalloc(256, GFP_KERNEL);
@@ -1017,12 +1383,29 @@ static int __init zte_atfix_init(void)
 		return -ENOMEM;
 	}
 
-	return usb_serial_register_drivers(zte_atfix_drivers, KBUILD_MODNAME,
+	/* claim the device before registering, then follow hot plug events */
+	usb_for_each_dev(NULL, zte_claim_walk);
+	usb_register_notify(&zte_usb_nb);
+
+	ret = usb_serial_register_drivers(zte_atfix_drivers, KBUILD_MODNAME,
 					   zte_atfix_ids);
+	if (ret) {
+		usb_unregister_notify(&zte_usb_nb);
+		destroy_workqueue(zte_wq);
+		kfree(zte_cmd_buf);
+		return ret;
+	}
+
+	queue_delayed_work(system_wq, &zte_claim_watch_work,
+			   msecs_to_jiffies(1000));
+	return 0;
 }
 
 static void __exit zte_atfix_exit(void)
 {
+	usb_unregister_notify(&zte_usb_nb);
+	cancel_work_sync(&zte_claim_work);
+	cancel_delayed_work_sync(&zte_claim_watch_work);
 	usb_serial_deregister_drivers(zte_atfix_drivers);
 	cancel_work_sync(&zte_init_work);
 	cancel_work_sync(&zte_dial_work);
