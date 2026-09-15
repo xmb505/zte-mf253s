@@ -33,6 +33,20 @@
 #define ZTE_PRODUCT_ID	0x0199
 #define ZTE_ECM_IFACE	1
 
+/*
+ * The interface has the data bulk endpoints plus a CDC interrupt status
+ * endpoint, but no CDC union descriptor, so the CDC bind helpers cannot be
+ * used.  Plain usbnet endpoint discovery is enough; usbnet_cdc_status
+ * (from cdc_ether) handles the status notifications on the interrupt
+ * endpoint.
+ */
+static const struct driver_info zte_ecm_info = {
+	.description	= "ZTE ZX297510 (MF253S) ECM data interface",
+	.flags		= FLAG_ETHER,
+	.status		= usbnet_cdc_status,
+	.manage_power	= usbnet_manage_power,
+};
+
 static const struct usb_device_id zte_ecm_ids[] = {
 	{
 		.match_flags	= USB_DEVICE_ID_MATCH_DEVICE |
@@ -44,19 +58,11 @@ static const struct usb_device_id zte_ecm_ids[] = {
 		.bInterfaceClass = USB_CLASS_VENDOR_SPEC,
 		.bInterfaceSubClass = 0xff,
 		.bInterfaceProtocol = 0xff,
+		.driver_info	= (kernel_ulong_t)&zte_ecm_info,
 	},
 	{ }
 };
 MODULE_DEVICE_TABLE(usb, zte_ecm_ids);
-
-static const struct driver_info zte_ecm_info = {
-	.description	= "ZTE ZX297510 (MF253S) ECM data interface",
-	.flags		= FLAG_ETHER,
-	.bind		= usbnet_generic_cdc_bind,
-	.unbind		= usbnet_cdc_unbind,
-	.status		= usbnet_cdc_status,
-	.manage_power	= usbnet_manage_power,
-};
 
 static struct usb_driver zte_ecm_driver = {
 	.name		= "zte_ecm",
