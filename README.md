@@ -49,7 +49,9 @@ NetworkManager ── ModemManager ──┬─ ttyUSB0 (AT, MM 管理)
 - **内核心跳**：probe 后自动执行 CPE 逆向出的初始化序列，并每 2 秒轮询 `AT+CSQ`/`AT+CEREG?`/`AT+COPS?`，彻底杜绝 21 秒自复位；
 - **私有口隐身**：驱动用 if2 做自己的事情（初始化/拨号/保活），并把 MM 探口的裸 `AT` 探测吞掉，MM 会把该口标记为「非 AT 口」自动无视；
 - **驱动内关闭 USB autosuspend**，不需要任何 udev 规则；
-- **APN 自动识别**：按 IMSI 前五位选择 CMNET / 3gnet / ctnet。
+- **APN 自动识别**：按 IMSI 前五位选择 CMNET / 3gnet / ctnet；
+- **设备认领**：模块的接口同时会被 `option`/`qmi_wwan` 匹配，驱动在加载时会把它们从别的驱动手里释放出来并接管（热插拔由 USB 通知 + 每秒看门狗兜底）。因此**不需要任何 modprobe 黑名单**，同一台机器上的 EC20 等模块照常用 `qmi_wwan`，互不干扰；
+- **私有口防护**：if2/if3 是驱动的私有通道，数据永远不进 tty 层（否则 ModemManager 探测时会看到驱动的轮询应答，把私有口当 AT 口抢走）。
 
 ## 安装
 
@@ -65,9 +67,9 @@ make -C drivers/zte_atfix
 sudo cp drivers/zte_ecm/zte_ecm.ko drivers/zte_atfix/zte_atfix.ko /lib/modules/$(uname -r)/extra/
 sudo depmod -a
 
-# 开机自动加载 + 黑名单 qmi_wwan（重要：MM 用 QMI 探它会把它搞崩）
+# 开机自动加载（驱动会自己从 option/qmi_wwan 手里抢回设备，
+# 不需要任何 modprobe 黑名单——qmi_wwan 可以留给 EC20 之类的模块用）
 printf 'zte_ecm\nzte_atfix\n' | sudo tee /etc/modules-load.d/zte.conf
-echo 'blacklist qmi_wwan' | sudo tee /etc/modprobe.d/zz-zte.conf
 
 # 立即加载
 sudo modprobe zte_ecm zte_atfix
@@ -80,6 +82,8 @@ sudo modprobe zte_ecm zte_atfix
 - **仅 IPv4**：固件虽支持 IPV6 PDP，但 ECM 通道没有 RA/NDP 转发能力，IPv6 实际不可用。驱动会**在数据面直接丢弃所有 IPv6 帧**（计入 `tx_dropped`），并尽力关闭该网卡的 IPv6 协议栈——上层开不开 IPv6 都行，不会有任何 v6 包发到模块；
 - **仅 TD-LTE 硬件**：移动版模块没有 WCDMA 校准数据，插联通卡收不到信号（这不是锁）；
 - **短信收发都可用（有前提）**：**发（MO）**实测成功（MM 的 Messaging 接口，PDU 模式，短信中心 `+8613800745500`）；**收（MT）**实测成功（收到了 B 站验证码 ✌）。前提是模块必须是**新鲜附着**的——这个 2013 年固件在"已附着"状态下不会重新协商 LTE 短信（SMS over NAS）能力，网络就不给投递（实测存储 `+CPMS: "SM",0,50` 死活为空；`AT+CFUN=0` → `AT+CFUN=1` 之后立刻恢复正常）。驱动初始化时会自动做一次 CFUN 0→1 循环（`force_reattach` 模块参数可关闭，代价是开机多等约 1 分钟）；
+- **USSD 不支持**：固件没有 `AT+CUSD`，`*100#` 这类查话费/业务办理用不了；
+- **语音不支持**：数据卡模块，没有通话功能（ModemManager 不暴露 Voice 接口）；
 - **不要热插拔 mSATA**：关机 → 插拔 → 开机；
 - 不同批次固件可能略有差异（开发基于 `ZTE_MF253SV1.0.0B01`）。
 
