@@ -19,7 +19,7 @@
  *
  *  1) command fixups on the AT interfaces (0, 2, 3):
  *       ATZ\r          -> rewritten to "ATE0\r"
- *       AT+WS46=?\r    -> synthetic "+WS46: (12,22,25)" + OK
+ *       AT+WS46=?\r    -> synthetic "+WS46: (28)" + OK
  *       AT+WS46=<n>\r  -> synthetic OK
  *       AT+GCAP\r      -> synthetic "+GCAP: +CGSM,+CLTE" + OK
  *       AT%IPSYS?\r    -> synthetic "%IPSYS: 0,1,0" + OK (Icera detection)
@@ -106,6 +106,7 @@ static const char * const zte_patterns[] = {
 #define ZTE_VAR_IPDPADDR	"AT%IPDPADDR="
 #define ZTE_VAR_IPDPACT		"AT%IPDPACT="
 #define ZTE_VAR_CEREG		"AT+CEREG="
+#define ZTE_VAR_IPSYS		"AT%IPSYS="
 
 /*
  * This firmware reports a non-standard CSQ value: for valid readings the
@@ -518,6 +519,18 @@ static void zte_augment_cereg_urc(struct usb_serial_port *port,
 	zte_atfix_inject(port, resp);
 }
 
+/*
+ * MM's Icera class loads the supported modes from AT%IPSYS=? and can only
+ * express 2G/3G combinations (there is no LTE case in its parser).  Report
+ * 3G-only so GNOME does not offer 2G or 5G modes; the modem itself stays on
+ * LTE regardless.
+ */
+static void zte_answer_ipsys_modes(struct usb_serial_port *port)
+{
+	dev_info(&port->dev, "answering AT%%IPSYS=? (3G-only modes)\n");
+	zte_atfix_inject(port, "\r\n%IPSYS: (1),(1)\r\n\r\nOK\r\n");
+}
+
 /* remember the URC mode MM configures, then pass AT+CEREG=<n> through */
 static void zte_cache_cereg_cmd(struct tty_struct *tty,
 				struct usb_serial_port *port,
@@ -720,6 +733,7 @@ static bool zte_var_hold(const u8 *p, int len)
 	size_t alen = strlen(ZTE_VAR_IPDPADDR);
 	size_t clen = strlen(ZTE_VAR_IPDPACT);
 	size_t rlen = strlen(ZTE_VAR_CEREG);
+	size_t ilen = strlen(ZTE_VAR_IPSYS);
 
 	if ((size_t)len < alen && !memcmp(p, ZTE_VAR_IPDPADDR, len))
 		return true;
@@ -727,12 +741,16 @@ static bool zte_var_hold(const u8 *p, int len)
 		return true;
 	if ((size_t)len < rlen && !memcmp(p, ZTE_VAR_CEREG, len))
 		return true;
+	if ((size_t)len < ilen && !memcmp(p, ZTE_VAR_IPSYS, len))
+		return true;
 
 	if ((size_t)len >= alen && !memcmp(p, ZTE_VAR_IPDPADDR, alen))
 		return memchr(p, '\r', len) == NULL;
 	if ((size_t)len >= clen && !memcmp(p, ZTE_VAR_IPDPACT, clen))
 		return memchr(p, '\r', len) == NULL;
 	if ((size_t)len >= rlen && !memcmp(p, ZTE_VAR_CEREG, rlen))
+		return memchr(p, '\r', len) == NULL;
+	if ((size_t)len >= ilen && !memcmp(p, ZTE_VAR_IPSYS, ilen))
 		return memchr(p, '\r', len) == NULL;
 
 	return false;
@@ -744,7 +762,8 @@ static bool zte_var_complete(const u8 *p, int len)
 		return false;
 	return !memcmp(p, ZTE_VAR_IPDPADDR, strlen(ZTE_VAR_IPDPADDR)) ||
 	       !memcmp(p, ZTE_VAR_IPDPACT, strlen(ZTE_VAR_IPDPACT)) ||
-	       !memcmp(p, ZTE_VAR_CEREG, strlen(ZTE_VAR_CEREG));
+	       !memcmp(p, ZTE_VAR_CEREG, strlen(ZTE_VAR_CEREG)) ||
+	       !memcmp(p, ZTE_VAR_IPSYS, strlen(ZTE_VAR_IPSYS));
 }
 
 /* ---------------------------------------------------------------------- */
@@ -1016,7 +1035,7 @@ static int zte_atfix_write(struct tty_struct *tty, struct usb_serial_port *port,
 	static const char gcap_resp[]  =
 		"\r\n+GCAP: +CGSM,+CLTE\r\n\r\nOK\r\n";
 	static const char ws46_resp[]  =
-		"\r\n+WS46: (12,22,25)\r\n\r\nOK\r\n";
+		"\r\n+WS46: (28)\r\n\r\nOK\r\n";
 	static const char ipsys_resp[] =
 		"\r\n%IPSYS: 0,1,0\r\n\r\nOK\r\n";
 	static const char ok_resp[]    = "\r\nOK\r\n";
@@ -1136,6 +1155,11 @@ static int zte_atfix_write(struct tty_struct *tty, struct usb_serial_port *port,
 			else if (!memcmp(st->pending, ZTE_VAR_IPDPACT,
 					 strlen(ZTE_VAR_IPDPACT)))
 				zte_answer_ipdpact(port, st->pending);
+			else if (!memcmp(st->pending, "AT%IPSYS=?\r", 11))
+				zte_answer_ipsys_modes(port);
+			else if (!memcmp(st->pending, ZTE_VAR_IPSYS,
+					 strlen(ZTE_VAR_IPSYS)))
+				zte_atfix_inject(port, ok_resp);
 			else
 				zte_cache_cereg_cmd(tty, port, st);
 			st->pending_len = 0;
