@@ -111,6 +111,19 @@ sudo systemctl enable --now ModemManager
 
 **想让 GNOME 显示真正的 4G/LTE**：给 MM 的 Icera 插件打个小补丁即可——`add_supported_mode()` 增加 `case 4 → MM_MODEM_MODE_4G`，`nwstate_to_act()` 增加 `"lte"` 分支，共约 10 行。驱动层面做不到这件事（这是 MM 插件的限制，不是模块固件的）。
 
+## 桌面短信通知（可选）
+
+`tools/zte-sms-notify.py` 监听 ModemManager 的短信信号，收到新短信时弹出桌面通知（GNOME/KDE 都行）：
+
+```bash
+sudo install -m 755 tools/zte-sms-notify.py /usr/local/bin/zte-sms-notify
+mkdir -p ~/.config/systemd/user
+cp tools/zte-sms-notify.service ~/.config/systemd/user/
+systemctl --user enable --now zte-sms-notify
+```
+
+需要完整的短信收发界面（聊天式浏览/回复）可以装 `chatty` 或 `modem-manager-gui`，两者都直接用 ModemManager，与本驱动完全兼容。
+
 ## 目录结构
 
 ```
