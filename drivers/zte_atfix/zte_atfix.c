@@ -260,6 +260,14 @@ static int zte_send_cmd(const char *cmd, char *resp, size_t respsz,
 		spin_unlock_irqrestore(&zte_cmd_lock, flags);
 		return -ENODEV;
 	}
+	/* disarm and let any late response to a previous timed-out command
+	 * drain away (otherwise it completes this command's wait instantly
+	 * with the wrong data) */
+	zte_cmd_pending = false;
+	spin_unlock_irqrestore(&zte_cmd_lock, flags);
+	msleep(150);
+
+	spin_lock_irqsave(&zte_cmd_lock, flags);
 	strscpy(zte_cmd_buf, cmd, 256);
 	zte_cmd_resp_len = 0;
 	zte_cmd_resp[0] = '\0';
