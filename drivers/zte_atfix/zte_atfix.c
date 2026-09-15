@@ -1278,7 +1278,10 @@ static void zte_atfix_process_read_urb(struct urb *urb)
 				complete(&zte_cmd_done);
 				return;
 			}
-			if (st->quiet && !port->port.tty)
+			/* private interfaces: never leak (our command responses,
+			 * keepalive polls, ...) into a userspace tty stream, or
+			 * ModemManager's AT probe sees them and grabs the port */
+			if (st->quiet)
 				return;
 		}
 	}
