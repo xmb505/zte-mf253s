@@ -19,10 +19,22 @@
  *
  *  1) command fixups on the AT interfaces (0, 2, 3):
  *       ATZ\r          -> rewritten to "ATE0\r"
- *       AT+WS46=?\r    -> synthetic "+WS46: (28)" + OK
+ *       AT+WS46=?\r    -> synthetic "+WS46: (28)" + OK (E-UTRAN only; note
+ *                         that 25 maps to MM_MODEM_MODE_ANY including 5G)
  *       AT+WS46=<n>\r  -> synthetic OK
  *       AT+GCAP\r      -> synthetic "+GCAP: +CGSM,+CLTE" + OK
  *       AT%IPSYS?\r    -> synthetic "%IPSYS: 0,1,0" + OK (Icera detection)
+ *       AT%IPSYS=?\r   -> synthetic "%IPSYS: (1),(1)" + OK (3G-only modes,
+ *                         MM's Icera parser has no LTE case)
+ *       AT%IPSYS=<n>\r -> synthetic OK
+ *       AT%NWSTATE\r   -> synthetic "%NWSTATE: ..." so MM's Icera access
+ *                         technology loader succeeds (technology string is
+ *                         configurable via the nwstate_tech parameter)
+ *       AT+CSQ\r       -> normalized to the standard 0..31 range on MM's
+ *                         interface (firmware reports 253 + RSRP, which MM
+ *                         would clamp to 100%)
+ *       AT+CEREG?\r    -> the firmware omits the AcT field, spoofed with
+ *                         AcT=7 (LTE)
  *     so that ModemManager enables LTE (EPS) tracking and picks its Icera
  *     modem/bearer implementation, which knows how to use a net data port.
  *

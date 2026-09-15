@@ -82,6 +82,20 @@ sudo modprobe zte_ecm zte_atfix
 - **不要热插拔 mSATA**：关机 → 插拔 → 开机；
 - 不同批次固件可能略有差异（开发基于 `ZTE_MF253SV1.0.0B01`）。
 
+## ModemManager（Icera 插件）的限制与妥协
+
+为了让 MM 使用 ECM 网口，驱动把模块伪装成 ZTE Icera 机型。但 MM 的 Icera 插件写于 LTE 普及之前，其**模式/制式映射里没有 LTE**（上游与本机 1.25.95 均如此，反汇编确认），因此界面上的网络类型只能"尽量接近"：
+
+| 项目 | MM Icera 插件的行为 | 驱动的处理 |
+|---|---|---|
+| `AT+WS46=?` | Icera 类不用它加载模式 | 伪造 `+WS46: (28)`（纯 E-UTRAN），供其他实现使用。注意 **25 会被 MM 映射成 `MM_MODEM_MODE_ANY`（含 5G）**，不要报 |
+| `AT%IPSYS=?` | 只能解析 2G/3G 组合（解析器无 LTE case） | 伪造 `%IPSYS: (1),(1)`（3G-only）→ GNOME 模式选择器只显示一个 3G 条目，**不会出现 5G/2G** |
+| `AT%IPSYS=<n>` | 用户切换模式时下发 | 直接回 OK（模块实际仍锁 LTE） |
+| `AT%NWSTATE` | 制式只能映射 2G/3G（无 LTE） | 伪造响应；`nwstate_tech` 模块参数可调（默认 `HSDPA-HSUPA-HSPA+` → GNOME 显示 3G） |
+| `AT+CSQ` | 期望标准 0..31 | 固件返回 `253 + RSRP(dBm)` 私有刻度（如 149 → RSRP -104 dBm），MM 会钳位成 100%；驱动归一化后上报，显示真实信号（约 60%） |
+
+**想让 GNOME 显示真正的 4G/LTE**：给 MM 的 Icera 插件打个小补丁即可——`add_supported_mode()` 增加 `case 4 → MM_MODEM_MODE_4G`，`nwstate_to_act()` 增加 `"lte"` 分支，共约 10 行。驱动层面做不到这件事（这是 MM 插件的限制，不是模块固件的）。
+
 ## 目录结构
 
 ```
