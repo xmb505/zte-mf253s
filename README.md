@@ -4,6 +4,9 @@
 
 装上这两个内核模块（`zte_ecm` + `zte_atfix`）后，**任何装 stock ModemManager / NetworkManager 的发行版都能即插即用**：任务栏出现「移动数据」，点一下就联网。无需守护进程、无需 udev 规则、无需手工拨号。
 
+**功能一览**：数据（原生 4G 网卡，开机自动连接）/ 信号（真实百分比）/ 短信收发 / EC20 等模块共存（无需黑名单）。
+IPv6 在数据面焊死；制式与模式的显示受 ModemManager Icera 插件限制（详见下文）。
+
 ```
 NetworkManager ── ModemManager ──┬─ ttyUSB0 (AT, MM 管理)
                                  │
@@ -53,6 +56,10 @@ NetworkManager ── ModemManager ──┬─ ttyUSB0 (AT, MM 管理)
 - **设备认领**：模块的接口同时会被 `option`/`qmi_wwan` 匹配，驱动在加载时会把它们从别的驱动手里释放出来并接管（热插拔由 USB 通知 + 每秒看门狗兜底）。因此**不需要任何 modprobe 黑名单**，同一台机器上的 EC20 等模块照常用 `qmi_wwan`，互不干扰；
 - **私有口防护**：if2/if3 是驱动的私有通道，数据永远不进 tty 层（否则 ModemManager 探测时会看到驱动的轮询应答，把私有口当 AT 口抢走）。
 
+> **启动时序**：驱动初始化时会做一次 `CFUN=0 → CFUN=1` 强制重组并等待注册（约 1 分钟），
+> 这是网络愿意投递 MT 短信的前提（见「已知限制」）；随后自动激活并绑定 ECM 数据路径。
+> 不需要短信功能可以 `force_reattach=0` 跳过，开机即可连接。
+
 ## 安装
 
 ```bash
@@ -73,6 +80,9 @@ printf 'zte_ecm\nzte_atfix\n' | sudo tee /etc/modules-load.d/zte.conf
 
 # 立即加载
 sudo modprobe zte_ecm zte_atfix
+
+# 确保 ModemManager 开机自启（数据/信号/短信的上层管理器）
+sudo systemctl enable --now ModemManager
 ```
 
 然后重启 ModemManager（或直接重启电脑），`nmcli device status` 里就会出现 `gsm` 设备，点击连接即可。
