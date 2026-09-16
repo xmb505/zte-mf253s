@@ -34,12 +34,24 @@
 #include <linux/module.h>
 #include <linux/usb.h>
 #include <linux/usb/usbnet.h>
+#include <linux/version.h>
 #include <net/addrconf.h>
 #include <net/if_inet6.h>
 
 #define ZTE_VENDOR_ID	0x19d2
 #define ZTE_PRODUCT_ID	0x0199
 #define ZTE_ECM_IFACE	1
+
+/*
+ * The USB core wraps the device_driver inside struct usbdrv_wrap before
+ * v6.8 (usb_driver.drvwrap.driver) and exposes it directly afterwards
+ * (usb_driver.driver).
+ */
+#if LINUX_VERSION_CODE >= KERNEL_VERSION(6, 8, 0)
+#define USB_DRIVER_DEV_DRIVER(udrv)	(&(udrv)->driver)
+#else
+#define USB_DRIVER_DEV_DRIVER(udrv)	(&(udrv)->drvwrap.driver)
+#endif
 
 static bool zte_ecm_v6_dropped;
 
@@ -125,8 +137,8 @@ static int zte_ecm_netdev_event(struct notifier_block *nb,
 		return NOTIFY_DONE;
 
 	/* match only the netdevs created by this driver */
-	if (!dev->dev.parent ||
-	    dev->dev.parent->driver != &zte_ecm_driver.driver)
+	if (!dev->dev.parent || !dev->dev.parent->driver ||
+	    strcmp(dev->dev.parent->driver->name, "zte_ecm"))
 		return NOTIFY_DONE;
 
 	idev = __in6_dev_get(dev);
@@ -152,10 +164,6 @@ static struct notifier_block zte_ecm_netdev_nb = {
  */
 static struct work_struct zte_ecm_claim_work;
 static bool zte_ecm_claim_attach;
-
-/* not declared in the installed headers */
-extern int device_driver_attach(const struct device_driver *drv,
-				struct device *dev);
 
 static int zte_ecm_claim_walk(struct usb_device *udev, void *data)
 {
@@ -183,7 +191,8 @@ static int zte_ecm_claim_walk(struct usb_device *udev, void *data)
 			device_release_driver(dev);
 		}
 		if (zte_ecm_claim_attach && !dev->driver)
-			device_driver_attach(&zte_ecm_driver.driver, dev);
+			device_driver_attach(USB_DRIVER_DEV_DRIVER(&zte_ecm_driver),
+					     dev);
 	}
 	return 0;
 }

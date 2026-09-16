@@ -68,10 +68,22 @@
 #include <linux/tty_flip.h>
 #include <linux/usb.h>
 #include <linux/usb/serial.h>
+#include <linux/version.h>
 #include <linux/workqueue.h>
 
 #define ZTE_VID 0x19d2
 #define ZTE_PID 0x0199
+
+/*
+ * The USB core wraps the device_driver inside struct usbdrv_wrap before
+ * v6.8 (usb_driver.drvwrap.driver) and exposes it directly afterwards
+ * (usb_driver.driver).
+ */
+#if LINUX_VERSION_CODE >= KERNEL_VERSION(6, 8, 0)
+#define USB_DRIVER_DEV_DRIVER(udrv)	(&(udrv)->driver)
+#else
+#define USB_DRIVER_DEV_DRIVER(udrv)	(&(udrv)->drvwrap.driver)
+#endif
 
 #define ZTE_MAX_PENDING	32
 
@@ -1351,10 +1363,6 @@ static struct usb_serial_driver zte_atfix_device = {
 
 #define ZTE_ATFIX_NAME	"zte_atfix"
 
-/* not declared in the installed headers */
-extern int device_driver_attach(const struct device_driver *drv,
-				struct device *dev);
-
 static struct work_struct zte_claim_work;
 static struct delayed_work zte_claim_watch_work;
 static bool zte_claim_attach;
@@ -1380,7 +1388,8 @@ static void zte_claim_interface(struct usb_interface *intf)
 	/* force-bind our driver when it is already registered */
 	if (zte_claim_attach && !dev->driver &&
 	    zte_atfix_device.usb_driver)
-		device_driver_attach(&zte_atfix_device.usb_driver->driver, dev);
+		device_driver_attach(USB_DRIVER_DEV_DRIVER(
+					     zte_atfix_device.usb_driver), dev);
 }
 
 static int zte_claim_walk(struct usb_device *udev, void *data)
