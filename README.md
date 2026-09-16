@@ -209,10 +209,7 @@ LTE 下发的地址是 `/32`、网关离网，netifd 照网关装默认路由会
 ```
 drivers/zte_ecm/     ECM 数据口驱动（usbnet）
 drivers/zte_atfix/   AT 修复 + Icera 伪装 + 拨号翻译 + 链路管理
-tools/               （历史遗留）用户态守护进程版本，仅供参考
 docs/                设计与逆向笔记
-research/            固件分析、CPE 逆向资料（不含固件二进制）
-extras/              同硬件上的蜂鸣器整活项目
 ```
 
 ## 许可证

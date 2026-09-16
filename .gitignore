@@ -11,19 +11,6 @@ Module.symvers
 
 # vendor firmware / blobs (not redistributable, large)
 firmware/
-research/ap/
-research/firmware/
-research/salesdl/
-research/container/partitions/
-research/modem/0x11F5B4/
-research/modem/0x181040/
-research/modem/analyze/
-research/modem/initramfs/
-research/modem/*.bin
-research/modem/*.cpio
-research/modem/*_fs/
-research/modem/*_rootfs/
-research/modem/pscpu_strings.txt
 **/*.lzma
 **/*.squashfs
 **/*.cramfs

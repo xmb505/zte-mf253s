@@ -1,5 +1,0 @@
-# keep release archives lean: they are used as the package source for the
-# OpenWrt kmod packages, only drivers/ (+ README/LICENSE) are needed there
-/extras export-ignore
-/research export-ignore
-/tools export-ignore
