@@ -87,6 +87,100 @@ sudo systemctl enable --now ModemManager
 
 然后重启 ModemManager（或直接重启电脑），`nmcli device status` 里就会出现 `gsm` 设备，点击连接即可。
 
+## 在 OpenWrt / ImmortalWrt 上集成（实测记录）
+
+> 驱动在 OpenWrt 系上同样即插即用；上层用官方 feed 的 `modemmanager` +
+> `luci-proto-modemmanager`（LuCI 自带「Cellular Network」状态页）。
+> 以下坑实测于 **ImmortalWrt 24.10.6（内核 6.6.133）**，都不是本模块固件的问题，
+> 而是 OpenWrt / ModemManager 集成的一般性问题。
+
+### 装包与接口配置
+
+```bash
+opkg install kmod-zte-ecm kmod-zte-atfix modemmanager luci-proto-modemmanager
+
+uci set network.mm=interface
+uci set network.mm.proto='modemmanager'
+uci set network.mm.device='0'    # MM 的 modem 序号
+uci set network.mm.apn='CMNET'
+uci commit network
+```
+
+### 坑 1：MM 装好后看不到已插着的模块
+
+OpenWrt 的 ModemManager 靠 hotplug 事件缓存发现设备；在装 MM **之前**就插着的设备
+不会被上报，`mmcli -L` 为空。把 USB 设备 unbind/rebind 一次即可（或重启）：
+
+```bash
+echo 1-5 > /sys/bus/usb/drivers/usb/unbind
+echo 1-5 > /sys/bus/usb/drivers/usb/rebind   # 路径按实际 USB 拓扑
+```
+
+### 坑 2：netifd 不认识 `modemmanager` 协议
+
+netifd 启动时加载 proto handler；若 `modemmanager` 包是后装的，`ifup mm` 毫无反应
+（接口报 `NO_DEVICE`）。需要**完整重启 netifd**（`restart` / `reload` 不够）：
+
+```bash
+/etc/init.d/network stop; sleep 2; /etc/init.d/network start
+```
+
+### 坑 3：开机竞争 + 失败后不重试
+
+proto 可能跑在 MM 探测到模块之前；一次失败后接口被标记 `available=0` 且不再重试
+（LuCI 显示「网络设备不存在」）。两步处理：
+
+让 ModemManager 先于 network 启动：
+
+```bash
+mv /etc/rc.d/S60dbus /etc/rc.d/S18dbus
+mv /etc/rc.d/S70modemmanager /etc/rc.d/S19modemmanager
+```
+
+并给 `/lib/netifd/proto/modemmanager.sh` 的模块校验加等待（最长 120s）：
+
+```diff
++	mmcount=0
++	while [ "${mmcount}" -lt 120 ]; do
++		modemstatus=$(mmcli --modem="${device}" --output-keyvalue 2>/dev/null)
++		modempath=$(modemmanager_get_field "${modemstatus}" "modem.dbus-path")
++		[ -n "${modempath}" ] && break
++		mmcount=$((mmcount + 1))
++		sleep 1
++	done
++
+ 	# validate that ModemManager is handling the modem at the sysfs path
+-	modemstatus=$(mmcli --modem="${device}" --output-keyvalue)
+-	modempath=$(modemmanager_get_field "${modemstatus}" "modem.dbus-path")
+```
+
+### 坑 4：`/32` 承载的默认路由
+
+LTE 下发的地址是 `/32`、网关离网，netifd 照网关装默认路由会失败（流量悄悄回落到
+局域网网关）。`/32` 时改用接口路由：
+
+```diff
+ 	[ -n "${gateway}" ] && {
+-		echo "adding default IPv4 route via ${gateway}"
+-		proto_add_ipv4_route "0.0.0.0" "0" "${gateway}" "${address}"
++		if [ "${prefix}" = "32" ]; then
++			# /32 point-to-point bearer: the gateway is off-link, so
++			# install the default route directly on the interface
++			echo "adding default IPv4 route over ${wwan}"
++			proto_add_ipv4_route "0.0.0.0" "0" "" "${address}"
++		else
++			echo "adding default IPv4 route via ${gateway}"
++			proto_add_ipv4_route "0.0.0.0" "0" "${gateway}" "${address}"
++		fi
+ 	}
+```
+
+### 其它注意
+
+- **LAN 接口不要设 `gateway`**：会把默认路由抢走，造成「能上网但不是走模块」的假象（实测踩过，用 `ip route get 223.5.5.5` 才验出真身）；
+- 要让 LAN 客户端共享模块上网：把 `mm` 加进 firewall 的 wan zone（`masq=1` 才有 NAT）；
+- 状态查看：`mmcli -m 0`，或 LuCI → Status → Cellular Network。
+
 ## 已知限制
 
 - **仅 IPv4**：固件虽支持 IPV6 PDP，但 ECM 通道没有 RA/NDP 转发能力，IPv6 实际不可用。驱动会**在数据面直接丢弃所有 IPv6 帧**（计入 `tx_dropped`），并尽力关闭该网卡的 IPv6 协议栈——上层开不开 IPv6 都行，不会有任何 v6 包发到模块；
