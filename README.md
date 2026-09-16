@@ -4,7 +4,7 @@
 
 装上这两个内核模块（`zte_ecm` + `zte_atfix`）后，**任何装 stock ModemManager / NetworkManager 的发行版都能即插即用**：任务栏出现「移动数据」，点一下就联网。无需守护进程、无需 udev 规则、无需手工拨号。
 
-**功能一览**：数据（原生 4G 网卡，开机自动连接）/ 信号（真实百分比）/ 短信收发 / EC20 等模块共存（无需黑名单）。
+**功能一览**：数据（原生 4G 网卡，开机自动连接）/ 信号（真实百分比）/ EC20 等模块共存（无需黑名单）。
 IPv6 在数据面焊死；制式与模式的显示受 ModemManager Icera 插件限制（详见下文）。
 
 ```
@@ -57,8 +57,8 @@ NetworkManager ── ModemManager ──┬─ ttyUSB0 (AT, MM 管理)
 - **私有口防护**：if2/if3 是驱动的私有通道，数据永远不进 tty 层（否则 ModemManager 探测时会看到驱动的轮询应答，把私有口当 AT 口抢走）。
 
 > **启动时序**：驱动初始化时会做一次 `CFUN=0 → CFUN=1` 强制重组并等待注册（约 1 分钟），
-> 这是网络愿意投递 MT 短信的前提（见「已知限制」）；随后自动激活并绑定 ECM 数据路径。
-> 不需要短信功能可以 `force_reattach=0` 跳过，开机即可连接。
+> 这是为了让模块进入干净的网络附着状态；随后自动激活并绑定 ECM 数据路径。
+> 不需要可以 `force_reattach=0` 跳过，开机即可连接。
 
 ## 安装
 
@@ -81,7 +81,7 @@ printf 'zte_ecm\nzte_atfix\n' | sudo tee /etc/modules-load.d/zte.conf
 # 立即加载
 sudo modprobe zte_ecm zte_atfix
 
-# 确保 ModemManager 开机自启（数据/信号/短信的上层管理器）
+# 确保 ModemManager 开机自启（数据/信号的上层管理器；通知走 MM GUI）
 sudo systemctl enable --now ModemManager
 ```
 
@@ -91,7 +91,6 @@ sudo systemctl enable --now ModemManager
 
 - **仅 IPv4**：固件虽支持 IPV6 PDP，但 ECM 通道没有 RA/NDP 转发能力，IPv6 实际不可用。驱动会**在数据面直接丢弃所有 IPv6 帧**（计入 `tx_dropped`），并尽力关闭该网卡的 IPv6 协议栈——上层开不开 IPv6 都行，不会有任何 v6 包发到模块；
 - **仅 TD-LTE 硬件**：移动版模块没有 WCDMA 校准数据，插联通卡收不到信号（这不是锁）；
-- **短信收发都可用（有前提）**：**发（MO）**实测成功（MM 的 Messaging 接口，PDU 模式，短信中心 `+8613800745500`）；**收（MT）**实测成功（收到了 B 站验证码 ✌）。前提是模块必须是**新鲜附着**的——这个 2013 年固件在"已附着"状态下不会重新协商 LTE 短信（SMS over NAS）能力，网络就不给投递（实测存储 `+CPMS: "SM",0,50` 死活为空；`AT+CFUN=0` → `AT+CFUN=1` 之后立刻恢复正常）。驱动初始化时会自动做一次 CFUN 0→1 循环（`force_reattach` 模块参数可关闭，代价是开机多等约 1 分钟）；
 - **USSD 不支持**：固件没有 `AT+CUSD`，`*100#` 这类查话费/业务办理用不了；
 - **语音不支持**：数据卡模块，没有通话功能（ModemManager 不暴露 Voice 接口）；
 - **不要热插拔 mSATA**：关机 → 插拔 → 开机；
@@ -110,19 +109,6 @@ sudo systemctl enable --now ModemManager
 | `AT+CSQ` | 期望标准 0..31 | 固件返回 `253 + RSRP(dBm)` 私有刻度（如 149 → RSRP -104 dBm），MM 会钳位成 100%；驱动归一化后上报，显示真实信号（约 60%） |
 
 **想让 GNOME 显示真正的 4G/LTE**：给 MM 的 Icera 插件打个小补丁即可——`add_supported_mode()` 增加 `case 4 → MM_MODEM_MODE_4G`，`nwstate_to_act()` 增加 `"lte"` 分支，共约 10 行。驱动层面做不到这件事（这是 MM 插件的限制，不是模块固件的）。
-
-## 桌面短信通知（可选）
-
-`tools/zte-sms-notify.py` 监听 ModemManager 的短信信号，收到新短信时弹出桌面通知（GNOME/KDE 都行）：
-
-```bash
-sudo install -m 755 tools/zte-sms-notify.py /usr/local/bin/zte-sms-notify
-mkdir -p ~/.config/systemd/user
-cp tools/zte-sms-notify.service ~/.config/systemd/user/
-systemctl --user enable --now zte-sms-notify
-```
-
-需要完整的短信收发界面（聊天式浏览/回复）可以装 `chatty` 或 `modem-manager-gui`，两者都直接用 ModemManager，与本驱动完全兼容。
 
 ## 目录结构
 
